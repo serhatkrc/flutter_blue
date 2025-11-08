@@ -1,0 +1,352 @@
+================================================================================
+FLUTTER BLUE NATIVE IMPLEMENTASYON HIZLI REFERANS
+================================================================================
+
+PROJE YAPISI:
+├── lib/flutter_blue.dart                      # Ana Dart API
+├── lib/src/flutter_blue.dart                  # FlutterBlue sınıf implementasyonu
+├── lib/gen/flutterblue.pb.dart               # Oluşturulan Protobuf sınıfları
+│
+├── android/src/main/java/com/pauldemarco/flutter_blue/
+│   ├── FlutterBluePlugin.java                 # Ana Android eklentisi (1022 satır)
+│   ├── ProtoMaker.java                        # Proto dönüşüm yardımcıları
+│   ├── AdvertisementParser.java               # BLE advertising data ayrıştırıcısı
+│   └── AndroidManifest.xml                    # İzinler: BLUETOOTH, BLUETOOTH_ADMIN, ACCESS_FINE_LOCATION
+│
+├── ios/Classes/
+│   ├── FlutterBluePlugin.h                    # iOS eklenti arayüzü
+│   └── FlutterBluePlugin.m                    # iOS eklenti implementasyonu (774 satır)
+│
+├── ios/gen/
+│   ├── Flutterblue.pbobjc.h                   # Oluşturulan Objective-C protobuf
+│   └── Flutterblue.pbobjc.m
+│
+└── protos/flutterblue.proto                   # Veri yapıları için tek doğruluk kaynağı
+
+================================================================================
+İLETİŞİM MİMARİSİ
+================================================================================
+
+KANALLAR:
+├── Method Channel: "plugins.pauldemarco.com/flutter_blue/methods"
+│   └── Komutlar için senkron istek-yanıt pattern'i
+│
+└── Event Channel: "plugins.pauldemarco.com/flutter_blue/state"
+    └── Durum yayınları için asenkron stream
+
+SERİLEŞTİRME:
+└── Protocol Buffers (binary format)
+    ├── Kompakt gösterim (JSON'dan ~%40-60 daha küçük)
+    ├── Dil-bağımsız
+    ├── Derleme zamanında type-safe
+    └── Şema versiyonlama desteği
+
+================================================================================
+ANDROID IMPLEMENTASYON AKIŞI
+================================================================================
+
+EKLENTI BAŞLATMA:
+  FlutterPlugin → onAttachedToEngine()
+  ActivityAware → onAttachedToActivity()
+  → MethodChannel + EventChannel kurulumu
+  → BluetoothManager/BluetoothAdapter oluşturma
+
+İSTEK İŞLEME:
+  onMethodCall(MethodCall, Result)
+  ├─ SENKRON: state, isAvailable, isOn
+  ├─ ASYNC BAŞLATILAN: startScan, connect, discoverServices, read, write
+  └─ Başarı/hata döndürür
+
+CİHAZ ÖNBELLEKLEMESİ:
+  Map<String, BluetoothDeviceCache> mDevices
+  └─ GATT instance'ları + MTU değerlerini saklar
+     Tekrarlanan bağlantıları önler
+
+CALLBACK'LER:
+  BluetoothGattCallback async olayları alır:
+  ├─ onConnectionStateChange()
+  ├─ onServicesDiscovered()
+  ├─ onCharacteristicRead/Write()
+  ├─ onCharacteristicChanged()        [Notification'lar]
+  ├─ onDescriptorRead/Write()
+  └─ onMtuChanged()
+
+  → invokeMethodUIThread(methodName, byteArray)
+     (Kanal işlemleri için UI thread'i garanti eder)
+
+TARAMA:
+  API 21+: BluetoothLeScanner (modern)
+  API <21: deprecated startLeScan (legacy)
+
+  Tekrar filtreleme:
+  ├─ Varsayılan: Tekrarları kaldır (aynı MAC adresi)
+  ├─ Opsiyonel: allowDuplicates=true ile tümünü tut
+  └─ Takip için ArrayList<String> kullanır (O(n) arama)
+
+DURUM STREAM'İ:
+  BluetoothAdapter.ACTION_STATE_CHANGED için BroadcastReceiver
+  → EventSink güncellemeleri Dart'a iletir
+  → Stream iptal edildiğinde kayıt silinir
+
+İZİNLER:
+  Tarama için ACCESS_FINE_LOCATION gerekli (Android 6.0+)
+  → ActivityCompat üzerinden otomatik istek
+  → İzin verilene kadar bekleyen çağrı kaydedilir
+  → onRequestPermissionsResult() içinde devam edilir
+
+================================================================================
+iOS IMPLEMENTASYON AKIŞI
+================================================================================
+
+EKLENTI BAŞLATMA:
+  +registerWithRegistrar:
+  → FlutterMethodChannel + FlutterEventChannel oluştur
+  → CBCentralManager'ı başlat
+  → Keşif takibi için yardımcı diziler oluştur
+
+İSTEK İŞLEME:
+  handleMethodCall:result:
+  ├─ SENKRON: state, isAvailable, isOn
+  ├─ ASYNC BAŞLATILAN: startScan, connect, discoverServices, read, write
+  └─ Veri veya FlutterError döndürür
+
+CENTRAL MANAGER DELEGASYONu:
+  CBCentralManagerDelegate callback'leri:
+  ├─ centralManagerDidUpdateState:      [Durum değişiklikleri]
+  ├─ centralManager:didDiscoverPeripheral:advertisementData:RSSI:
+  ├─ centralManager:didConnectPeripheral:
+  └─ centralManager:didDisconnectPeripheral:error:
+
+PERIPHERAL DELEGASYONu:
+  CBPeripheralDelegate callback'leri:
+  ├─ peripheral:didDiscoverServices:
+  ├─ peripheral:didDiscoverCharacteristicsForService:
+  ├─ peripheral:didDiscoverDescriptorsForCharacteristic:
+  ├─ peripheral:didUpdateValueForCharacteristic:         [Notification'lar]
+  ├─ peripheral:didWriteValueForCharacteristic:
+  ├─ peripheral:didUpdateValueForDescriptor:
+  └─ peripheral:didWriteValueForDescriptor:
+
+KEŞİF STATE MACHINE:
+  Yardımcı Diziler:
+  ├─ servicesThatNeedDiscovered
+  └─ characteristicsThatNeedDiscovered
+
+  İşlem:
+  1. didDiscoverServices → Servisleri ekle, characteristic'leri keşfet
+  2. didDiscoverCharacteristicsForService → Characteristic'leri ekle, descriptor'ları keşfet
+  3. didDiscoverDescriptorsForCharacteristic → Kuyruktan çıkar, tamamlandı mı kontrol et
+  4. Hepsi keşfedildi mi? → DiscoverServicesResult gönder
+
+PERIPHERAL ÖNBELLEKLEMESİ:
+  NSMutableDictionary *scannedPeripherals
+  └─ Key: UUID string
+     Value: CBPeripheral instance
+
+PERIPHERAL ARAMA:
+  retrievePeripheralsWithIdentifiers: (CBPeripheral dizisi döndürür)
+  → Eşleşen UUID için linear arama (verimsiz)
+
+UUID İŞLEME:
+  CBUUID Extension: fullUUIDString
+  ├─ 16-bit: "180A" → "0000180a-0000-1000-8000-00805f9b34fb"
+  ├─ 128-bit: Olduğu gibi döndürür (küçük harf)
+  └─ Android ile tutarlılığı sağlar
+
+MTU İŞLEME:
+  iOS 9.0+ ise: maximumWriteValueLengthForType:
+  değilse: 20'ye fallback
+
+  requestMtu desteği yok (iOS limitasyonu)
+  → Platform üzerinden otomatik müzakere
+
+DURUM STREAM'İ:
+  FlutterBlueStreamHandler (FlutterStreamHandler'a uygun)
+  → centralManagerDidUpdateState callback'ini alır
+  → EventSink üzerinden iletir
+
+LİMİTASYONLAR:
+  ├─ requestMtu desteklenmiyor
+  ├─ İkincil servis keşfi eksik (yorum satırı kodu)
+  └─ Cihaz araması linear search (O(n))
+
+================================================================================
+METHOD ÇAĞRI MATRİSİ
+================================================================================
+
+METHOD                  | ANDROID | iOS | İSTEK TİPİ               | YANIT TİPİ
+setLogLevel            | ✓       | ✓   | int (LogLevel index)      | null
+state                  | ✓       | ✓   | null                      | BluetoothState
+isAvailable            | ✓       | ✓   | null                      | bool
+isOn                   | ✓       | ✓   | null                      | bool
+startScan              | ✓       | ✓   | ScanSettings proto        | null
+stopScan               | ✓       | ✓   | null                      | null
+getConnectedDevices    | ✓       | ✓   | null                      | ConnectedDevicesResponse
+connect                | ✓       | ✓   | ConnectRequest            | null
+disconnect             | ✓       | ✓   | string (remoteId)         | null
+deviceState            | ✓       | ✓   | string (remoteId)         | DeviceStateResponse
+discoverServices       | ✓       | ✓   | string (remoteId)         | null
+services               | ✓       | ✓   | string (remoteId)         | DiscoverServicesResult
+readCharacteristic     | ✓       | ✓   | ReadCharacteristicRequest | null
+readDescriptor         | ✓       | ✓   | ReadDescriptorRequest     | null
+writeCharacteristic    | ✓       | ✓   | WriteCharacteristicRequest| null
+writeDescriptor        | ✓       | ✓   | WriteDescriptorRequest    | null
+setNotification        | ✓       | ✓   | SetNotificationRequest    | null
+mtu                    | ✓       | ✓   | string (remoteId)         | MtuSizeResponse
+requestMtu             | ✓       | ✗   | MtuSizeRequest            | null
+
+================================================================================
+ÇAĞRILAN METODLAR (Native → Dart)
+================================================================================
+
+ScanResult                    [Yayın Stream'i] Yeni cihaz keşfedildi
+DeviceState                   [Yayın Stream'i] Bağlantı durumu değişti
+DiscoverServicesResult        [Yayın Stream'i] Servis keşfi tamamlandı
+ReadCharacteristicResponse    [Yayın Stream'i] Okuma yanıtı alındı
+WriteCharacteristicResponse   [Yayın Stream'i] Yazma onaylandı
+OnCharacteristicChanged       [Yayın Stream'i] Notification alındı
+ReadDescriptorResponse        [Yayın Stream'i] Descriptor okuma tamamlandı
+WriteDescriptorResponse       [Yayın Stream'i] Descriptor yazma onaylandı
+SetNotificationResponse       [Yayın Stream'i] Notification etkinleştirildi/devre dışı bırakıldı
+MtuSize                       [Yayın Stream'i] MTU müzakere edildi
+
+DURUM STREAM GÜNCELLEMELERİ:
+├─ Abonelikte başlangıç durumu
+└─ Bluetooth adaptör durum değişikliğinde güncellemeler
+
+================================================================================
+TEMEL TASARIM KARARLARI
+================================================================================
+
+1. PROTOCOL BUFFERS
+   ✓ Tek şema (protos/flutterblue.proto)
+   ✓ Tüm veriler serileştirilebilir olmalı
+   ✓ Geriye dönük uyumlu evrim
+   ✗ JSON yok (verimlilik hata ayıklanabilirliğe tercih edildi)
+
+2. ÇİFT KANAL
+   ✓ Method Channel: İstek-yanıt (komutlar)
+   ✓ Event Channel: Akış (durum + sonuçlar)
+   ✓ Sorumlulukları açıkça ayırır
+
+3. ASENKron KÖPRÜLEME
+   ✓ İstek hemen döner (tamamlanmadı)
+   ✓ Sonuçlar ayrı method çağrısıyla gelir
+   ✓ Dart stream'leri birden fazla sonucu işler
+   ✗ Dokümantasyon olmadan kafa karıştırıcı olabilir
+
+4. CİHAZ ÖNBELLEKLEMESİ
+   ✓ Android: GATT bağlantılarını + MTU'yu önbelleğe alır
+   ✓ iOS: CBPeripheral nesnelerini önbelleğe alır
+   ✓ Kaynak sızıntılarını önler
+   ✗ Bağlantı kesildiğinde geçersiz kılınmalı
+
+5. THREAD GÜVENLİĞİ
+   ✓ Android: Tüm kanal işlemleri runOnUiThread() ile UI thread'de
+   ✓ iOS: Ana thread'de delegate callback'leri (framework tarafından garanti)
+   ✗ İşlemler çok ağırsa jank'e neden olabilir
+
+6. TARAMA ÇİFT-MOD (Sadece Android)
+   ✓ API 21+: Modern BluetoothLeScanner
+   ✓ API 19-20: Legacy startLeScan
+   ✓ Eski cihazları destekler
+   ✗ Kod tekrarı
+
+7. KEŞİF STATE MACHINE (iOS)
+   ✓ Tüm keşfi tek yanıtta toplar
+   ✓ Büyük servisler için verimli
+   ✗ iOS implementasyonuna karmaşıklık ekler
+
+================================================================================
+KRİTİK KOD YOLLARI
+================================================================================
+
+TARAMA:
+  Dart scan()
+  → _channel.invokeMethod('startScan', buffer)
+  → Android: startScan21/18()
+  → BluetoothLeScanner.startScan(filters, settings, callback)
+  → ScanCallback.onScanResult()
+  → invokeMethodUIThread("ScanResult", byteArray)
+  → Dart: _methodStream.where(m => m.method == "ScanResult")
+
+BAĞLANTI:
+  Dart connect(remoteId)
+  → _channel.invokeMethod('connect', buffer)
+  → Android: device.connectGatt(activity, autoConnect, mGattCallback)
+  → Dart hemen döner
+  → BluetoothGattCallback.onConnectionStateChange()
+  → invokeMethodUIThread("DeviceState", byteArray)
+  → Dart: stream üzerinden alır
+
+OKUMA:
+  Dart read(characteristicUuid)
+  → _channel.invokeMethod('readCharacteristic', buffer)
+  → Android: gatt.readCharacteristic(characteristic) [bool döner, veri değil]
+  → Dart hemen döner
+  → BluetoothGattCallback.onCharacteristicRead()
+  → invokeMethodUIThread("ReadCharacteristicResponse", byteArray)
+  → Dart: characteristic.value'yu stream üzerinden alır
+
+NOTIFICATION:
+  Dart setNotification(true)
+  → _channel.invokeMethod('setNotification', buffer)
+  → Android:
+    1. gatt.setCharacteristicNotification(char, true)
+    2. CCCD descriptor'ını bul (0x2902)
+    3. gatt.writeDescriptor(CCCD)
+  → BluetoothGattCallback.onDescriptorWrite() [CCCD]
+  → invokeMethodUIThread("SetNotificationResponse", byteArray)
+  → Sonra: BluetoothGattCallback.onCharacteristicChanged()
+  → invokeMethodUIThread("OnCharacteristicChanged", byteArray)
+  → Dart: Stream'de notification'ları alır
+
+================================================================================
+PERFORMANS HUSUSLARI
+================================================================================
+
+DARBOĞAZLAR:
+1. Android ArrayList taraması (tekrarlar için O(n))
+   → Düşünülebilir: HashSet<String>
+
+2. iOS linear peripheral araması
+   → Düşünülebilir: UUID → CBPeripheral map önbelleği
+
+3. GATT işlem toplama yok
+   → Her okuma/yazma ayrı callback
+   → Dart'ta manuel olarak sıralanmalı
+
+4. MTU takibi tutarsızlığı
+   → Android: Önbelleğe alınmış, callback'de güncellenir
+   → iOS: İstek üzerine sorgulanır
+
+5. Servis keşif state machine (iOS)
+   → N servis + M characteristic + K descriptor
+   → N + M + K callback çağrısı
+   → Tek toplu yanıt
+
+OPTİMİZASYON FIRSATLARI:
+├─ Okuma/yazma toplama implementasyonu
+├─ Kalıcı peripheral referanslarını önbelleğe alma
+├─ Büyük servis ağaçlarını profilleme
+├─ Keşif için callback çağrılarını azaltma
+└─ Cihaz önbellekleme ile bellek kullanımını izleme
+
+================================================================================
+DOSYA KONUMLARI ÖZETİ
+================================================================================
+
+MUTLAK YOLLAR:
+├─ /home/user/flutter_blue/lib/flutter_blue.dart
+├─ /home/user/flutter_blue/lib/src/flutter_blue.dart
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/FlutterBluePlugin.java
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/ProtoMaker.java
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/AdvertisementParser.java
+├─ /home/user/flutter_blue/ios/Classes/FlutterBluePlugin.h
+├─ /home/user/flutter_blue/ios/Classes/FlutterBluePlugin.m
+├─ /home/user/flutter_blue/protos/flutterblue.proto
+├─ /home/user/flutter_blue/lib/gen/flutterblue.pb.dart
+├─ /home/user/flutter_blue/ios/gen/Flutterblue.pbobjc.h
+└─ /home/user/flutter_blue/ios/gen/Flutterblue.pbobjc.m
+
+================================================================================

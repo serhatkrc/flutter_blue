@@ -1,0 +1,352 @@
+================================================================================
+FLUTTER BLUE NATIVE IMPLEMENTATION QUICK REFERENCE
+================================================================================
+
+PROJECT STRUCTURE:
+├── lib/flutter_blue.dart                      # Main Dart API
+├── lib/src/flutter_blue.dart                  # FlutterBlue class implementation
+├── lib/gen/flutterblue.pb.dart               # Generated Protobuf classes
+│
+├── android/src/main/java/com/pauldemarco/flutter_blue/
+│   ├── FlutterBluePlugin.java                 # Main Android plugin (1022 lines)
+│   ├── ProtoMaker.java                        # Proto conversion utilities
+│   ├── AdvertisementParser.java               # BLE advertisement data parser
+│   └── AndroidManifest.xml                    # Permissions: BLUETOOTH, BLUETOOTH_ADMIN, ACCESS_FINE_LOCATION
+│
+├── ios/Classes/
+│   ├── FlutterBluePlugin.h                    # iOS plugin interface
+│   └── FlutterBluePlugin.m                    # iOS plugin implementation (774 lines)
+│
+├── ios/gen/
+│   ├── Flutterblue.pbobjc.h                   # Generated Objective-C protobuf
+│   └── Flutterblue.pbobjc.m
+│
+└── protos/flutterblue.proto                   # Single source of truth for data structures
+
+================================================================================
+COMMUNICATION ARCHITECTURE
+================================================================================
+
+CHANNELS:
+├── Method Channel: "plugins.pauldemarco.com/flutter_blue/methods"
+│   └── Synchronous request-response pattern for commands
+│
+└── Event Channel: "plugins.pauldemarco.com/flutter_blue/state"
+    └── Asynchronous stream for state broadcasts
+
+SERIALIZATION:
+└── Protocol Buffers (binary format)
+    ├── Compact representation (~40-60% smaller than JSON)
+    ├── Language-agnostic
+    ├── Type-safe at compile time
+    └── Schema versioning support
+
+================================================================================
+ANDROID IMPLEMENTATION FLOW
+================================================================================
+
+PLUGIN INITIALIZATION:
+  FlutterPlugin → onAttachedToEngine()
+  ActivityAware → onAttachedToActivity()
+  → Setup MethodChannel + EventChannel
+  → Create BluetoothManager/BluetoothAdapter
+
+REQUEST HANDLING:
+  onMethodCall(MethodCall, Result)
+  ├─ SYNCHRONOUS: state, isAvailable, isOn
+  ├─ ASYNC INITIATED: startScan, connect, discoverServices, read, write
+  └─ Returns success/error
+
+DEVICE CACHING:
+  Map<String, BluetoothDeviceCache> mDevices
+  └─ Stores GATT instances + MTU values
+     Prevents duplicate connections
+
+CALLBACKS:
+  BluetoothGattCallback receives async events:
+  ├─ onConnectionStateChange()
+  ├─ onServicesDiscovered()
+  ├─ onCharacteristicRead/Write()
+  ├─ onCharacteristicChanged()        [Notifications]
+  ├─ onDescriptorRead/Write()
+  └─ onMtuChanged()
+  
+  → invokeMethodUIThread(methodName, byteArray)
+     (Ensures UI thread for channel operations)
+
+SCANNING:
+  API 21+: BluetoothLeScanner (modern)
+  API <21: deprecated startLeScan (legacy)
+  
+  Duplicate filtering:
+  ├─ Default: Remove duplicates (same MAC address)
+  ├─ Optional: Keep all via allowDuplicates=true
+  └─ Uses ArrayList<String> for tracking (O(n) lookup)
+
+STATE STREAM:
+  BroadcastReceiver for BluetoothAdapter.ACTION_STATE_CHANGED
+  → EventSink forwards updates to Dart
+  → Unregistered when stream cancelled
+
+PERMISSIONS:
+  ACCESS_FINE_LOCATION required for scanning (Android 6.0+)
+  → Automatic request via ActivityCompat
+  → Pending call saved until permission granted
+  → Resumed in onRequestPermissionsResult()
+
+================================================================================
+iOS IMPLEMENTATION FLOW
+================================================================================
+
+PLUGIN INITIALIZATION:
+  +registerWithRegistrar:
+  → Create FlutterMethodChannel + FlutterEventChannel
+  → Initialize CBCentralManager
+  → Create helper arrays for discovery tracking
+
+REQUEST HANDLING:
+  handleMethodCall:result:
+  ├─ SYNCHRONOUS: state, isAvailable, isOn
+  ├─ ASYNC INITIATED: startScan, connect, discoverServices, read, write
+  └─ Returns data or FlutterError
+
+CENTRAL MANAGER DELEGATION:
+  CBCentralManagerDelegate callbacks:
+  ├─ centralManagerDidUpdateState:      [State changes]
+  ├─ centralManager:didDiscoverPeripheral:advertisementData:RSSI:
+  ├─ centralManager:didConnectPeripheral:
+  └─ centralManager:didDisconnectPeripheral:error:
+
+PERIPHERAL DELEGATION:
+  CBPeripheralDelegate callbacks:
+  ├─ peripheral:didDiscoverServices:
+  ├─ peripheral:didDiscoverCharacteristicsForService:
+  ├─ peripheral:didDiscoverDescriptorsForCharacteristic:
+  ├─ peripheral:didUpdateValueForCharacteristic:         [Notifications]
+  ├─ peripheral:didWriteValueForCharacteristic:
+  ├─ peripheral:didUpdateValueForDescriptor:
+  └─ peripheral:didWriteValueForDescriptor:
+
+DISCOVERY STATE MACHINE:
+  Helper Arrays:
+  ├─ servicesThatNeedDiscovered
+  └─ characteristicsThatNeedDiscovered
+  
+  Process:
+  1. didDiscoverServices → Add services, discover characteristics
+  2. didDiscoverCharacteristicsForService → Add characteristics, discover descriptors
+  3. didDiscoverDescriptorsForCharacteristic → Remove from queue, check if done
+  4. All discovered? → Send DiscoverServicesResult
+
+PERIPHERAL CACHING:
+  NSMutableDictionary *scannedPeripherals
+  └─ Key: UUID string
+     Value: CBPeripheral instance
+
+PERIPHERAL LOOKUP:
+  retrievePeripheralsWithIdentifiers: (returns CBPeripheral array)
+  → Linear search for matching UUID (inefficient)
+
+UUID HANDLING:
+  CBUUID Extension: fullUUIDString
+  ├─ 16-bit: "180A" → "0000180a-0000-1000-8000-00805f9b34fb"
+  ├─ 128-bit: Returns as-is (lowercase)
+  └─ Ensures consistency with Android
+
+MTU HANDLING:
+  if iOS 9.0+: maximumWriteValueLengthForType:
+  else: Fallback to 20
+  
+  No requestMtu support (iOS limitation)
+  → Automatic negotiation via platform
+
+STATE STREAM:
+  FlutterBlueStreamHandler (conforms to FlutterStreamHandler)
+  → Receives centralManagerDidUpdateState callback
+  → Forwards via EventSink
+
+LIMITATIONS:
+  ├─ requestMtu not supported
+  ├─ Secondary service discovery incomplete (commented code)
+  └─ Device lookup is linear search (O(n))
+
+================================================================================
+METHOD CALL MATRIX
+================================================================================
+
+METHOD                  | ANDROID | iOS | REQUEST TYPE              | RESPONSE TYPE
+setLogLevel            | ✓       | ✓   | int (LogLevel index)      | null
+state                  | ✓       | ✓   | null                      | BluetoothState
+isAvailable            | ✓       | ✓   | null                      | bool
+isOn                   | ✓       | ✓   | null                      | bool
+startScan              | ✓       | ✓   | ScanSettings proto        | null
+stopScan               | ✓       | ✓   | null                      | null
+getConnectedDevices    | ✓       | ✓   | null                      | ConnectedDevicesResponse
+connect                | ✓       | ✓   | ConnectRequest            | null
+disconnect             | ✓       | ✓   | string (remoteId)         | null
+deviceState            | ✓       | ✓   | string (remoteId)         | DeviceStateResponse
+discoverServices       | ✓       | ✓   | string (remoteId)         | null
+services               | ✓       | ✓   | string (remoteId)         | DiscoverServicesResult
+readCharacteristic     | ✓       | ✓   | ReadCharacteristicRequest | null
+readDescriptor         | ✓       | ✓   | ReadDescriptorRequest     | null
+writeCharacteristic    | ✓       | ✓   | WriteCharacteristicRequest| null
+writeDescriptor        | ✓       | ✓   | WriteDescriptorRequest    | null
+setNotification        | ✓       | ✓   | SetNotificationRequest    | null
+mtu                    | ✓       | ✓   | string (remoteId)         | MtuSizeResponse
+requestMtu             | ✓       | ✗   | MtuSizeRequest            | null
+
+================================================================================
+INVOKED METHODS (Native → Dart)
+================================================================================
+
+ScanResult                    [Broadcast Stream] New device discovered
+DeviceState                   [Broadcast Stream] Connection state changed
+DiscoverServicesResult        [Broadcast Stream] Services discovery complete
+ReadCharacteristicResponse    [Broadcast Stream] Read response received
+WriteCharacteristicResponse   [Broadcast Stream] Write confirmed
+OnCharacteristicChanged       [Broadcast Stream] Notification received
+ReadDescriptorResponse        [Broadcast Stream] Descriptor read complete
+WriteDescriptorResponse       [Broadcast Stream] Descriptor write confirmed
+SetNotificationResponse       [Broadcast Stream] Notification enabled/disabled
+MtuSize                       [Broadcast Stream] MTU negotiated
+
+STATE STREAM UPDATES:
+├─ Initial state on subscribe
+└─ Updates on Bluetooth adapter state change
+
+================================================================================
+KEY DESIGN DECISIONS
+================================================================================
+
+1. PROTOCOL BUFFERS
+   ✓ Single schema (protos/flutterblue.proto)
+   ✓ All data must be serializable
+   ✓ Backwards compatible evolution
+   ✗ No JSON (efficiency over debuggability)
+
+2. DUAL CHANNELS
+   ✓ Method Channel: Request-response (commands)
+   ✓ Event Channel: Streaming (state + results)
+   ✓ Separates concerns clearly
+
+3. ASYNCHRONOUS BRIDGING
+   ✓ Request returns immediately (not complete)
+   ✓ Results arrive via separate method invocation
+   ✓ Dart streams handle multiple results
+   ✗ Can be confusing without documentation
+
+4. DEVICE CACHING
+   ✓ Android: Caches GATT connections + MTU
+   ✓ iOS: Caches CBPeripheral objects
+   ✓ Prevents resource leaks
+   ✗ Must invalidate on disconnection
+
+5. THREAD SAFETY
+   ✓ Android: All channel ops on UI thread via runOnUiThread()
+   ✓ iOS: Delegate callbacks on main thread (guaranteed by framework)
+   ✗ Can cause jank if operations too heavy
+
+6. SCANNING DUAL-MODE (Android only)
+   ✓ API 21+: Modern BluetoothLeScanner
+   ✓ API 19-20: Legacy startLeScan
+   ✓ Supports older devices
+   ✗ Code duplication
+
+7. DISCOVERY STATE MACHINE (iOS)
+   ✓ Batches all discovery in single response
+   ✓ Efficient for large services
+   ✗ Adds complexity to iOS implementation
+
+================================================================================
+CRITICAL CODE PATHS
+================================================================================
+
+SCANNING:
+  Dart scan() 
+  → _channel.invokeMethod('startScan', buffer)
+  → Android: startScan21/18() 
+  → BluetoothLeScanner.startScan(filters, settings, callback)
+  → ScanCallback.onScanResult()
+  → invokeMethodUIThread("ScanResult", byteArray)
+  → Dart: _methodStream.where(m => m.method == "ScanResult")
+
+CONNECTION:
+  Dart connect(remoteId)
+  → _channel.invokeMethod('connect', buffer)
+  → Android: device.connectGatt(activity, autoConnect, mGattCallback)
+  → Dart immediately returns
+  → BluetoothGattCallback.onConnectionStateChange()
+  → invokeMethodUIThread("DeviceState", byteArray)
+  → Dart: receives via stream
+
+READING:
+  Dart read(characteristicUuid)
+  → _channel.invokeMethod('readCharacteristic', buffer)
+  → Android: gatt.readCharacteristic(characteristic) [returns bool, not data]
+  → Dart immediately returns
+  → BluetoothGattCallback.onCharacteristicRead()
+  → invokeMethodUIThread("ReadCharacteristicResponse", byteArray)
+  → Dart: receives characteristic.value via stream
+
+NOTIFICATION:
+  Dart setNotification(true)
+  → _channel.invokeMethod('setNotification', buffer)
+  → Android: 
+    1. gatt.setCharacteristicNotification(char, true)
+    2. Find CCCD descriptor (0x2902)
+    3. gatt.writeDescriptor(CCCD)
+  → BluetoothGattCallback.onDescriptorWrite() [CCCD]
+  → invokeMethodUIThread("SetNotificationResponse", byteArray)
+  → Later: BluetoothGattCallback.onCharacteristicChanged()
+  → invokeMethodUIThread("OnCharacteristicChanged", byteArray)
+  → Dart: Receives notifications on stream
+
+================================================================================
+PERFORMANCE CONSIDERATIONS
+================================================================================
+
+BOTTLENECKS:
+1. Android ArrayList scanning (O(n) for duplicates)
+   → Consider: HashSet<String>
+
+2. iOS linear peripheral lookup
+   → Consider: Cache UUID → CBPeripheral map
+
+3. No GATT operation batching
+   → Each read/write is separate callback
+   → Must sequence in Dart manually
+
+4. MTU tracking inconsistency
+   → Android: Cached, updated on callback
+   → iOS: Queried on demand
+
+5. Service discovery state machine (iOS)
+   → N services + M characteristics + K descriptors
+   → N + M + K callback invocations
+   → Single batched response
+
+OPTIMIZATION OPPORTUNITIES:
+├─ Implement read/write batching
+├─ Cache persistent peripheral references
+├─ Profile large service trees
+├─ Reduce callback invocations for discovery
+└─ Monitor memory usage with device caching
+
+================================================================================
+FILE LOCATIONS SUMMARY
+================================================================================
+
+ABSOLUTE PATHS:
+├─ /home/user/flutter_blue/lib/flutter_blue.dart
+├─ /home/user/flutter_blue/lib/src/flutter_blue.dart
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/FlutterBluePlugin.java
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/ProtoMaker.java
+├─ /home/user/flutter_blue/android/src/main/java/com/pauldemarco/flutter_blue/AdvertisementParser.java
+├─ /home/user/flutter_blue/ios/Classes/FlutterBluePlugin.h
+├─ /home/user/flutter_blue/ios/Classes/FlutterBluePlugin.m
+├─ /home/user/flutter_blue/protos/flutterblue.proto
+├─ /home/user/flutter_blue/lib/gen/flutterblue.pb.dart
+├─ /home/user/flutter_blue/ios/gen/Flutterblue.pbobjc.h
+└─ /home/user/flutter_blue/ios/gen/Flutterblue.pbobjc.m
+
+================================================================================
